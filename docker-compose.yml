@@ -1,0 +1,66 @@
+services:
+  chromadb:
+    image: ${CHROMADB_IMAGE:-chromadb/chroma:latest}
+    container_name: ${COMPOSE_PROJECT_NAME:-context-ref}-chromadb
+    ports:
+      - "${CHROMADB_PORT:-8000}:8000"
+    environment:
+      - CHROMA_SERVER_AUTH_PROVIDER=${CHROMADB_AUTH_PROVIDER:-}
+      - CHROMA_SERVER_AUTH_CREDENTIALS_PROVIDER=${CHROMADB_AUTH_CREDENTIALS_PROVIDER:-}
+    volumes:
+      - chromadb_data:/chromadb_data
+    networks:
+      - ${COMPOSE_PROJECT_NAME:-context-ref}-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: ${HEALTHCHECK_INTERVAL:-30s}
+      timeout: ${HEALTHCHECK_TIMEOUT:-10s}
+      retries: ${HEALTHCHECK_RETRIES:-5}
+
+  redis:
+    image: ${REDIS_IMAGE:-redis:7-alpine}
+    container_name: ${COMPOSE_PROJECT_NAME:-context-ref}-redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - ${COMPOSE_PROJECT_NAME:-context-ref}-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: ${HEALTHCHECK_INTERVAL:-30s}
+      timeout: ${HEALTHCHECK_TIMEOUT:-10s}
+      retries: ${HEALTHCHECK_RETRIES:-5}
+
+  app:
+    build:
+      context: ${BUILD_CONTEXT:-.}
+      dockerfile: ${BUILD_DOCKERFILE:-Dockerfile}
+    container_name: ${COMPOSE_PROJECT_NAME:-context-ref}-app
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    environment:
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - PYTHONPATH=${PYTHONPATH:-/app}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./src:/app/src
+      - ./tests:/app/tests
+      - ./examples:/app/examples
+    depends_on:
+      chromadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ${COMPOSE_PROJECT_NAME:-context-ref}-network
+
+volumes:
+  chromadb_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  ${COMPOSE_PROJECT_NAME:-context-ref}-network:
+    driver: bridge
