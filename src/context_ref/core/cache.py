@@ -169,6 +169,11 @@ class ToolCache:
         for idx, entry_id in enumerate(results["ids"][0]):
             entry_data = self._storage.get(entry_id)
             if entry_data is None:
+                try:
+                    if not self._storage.exists(entry_id):
+                        self.vector_store.delete(ids=[entry_id])
+                except Exception:
+                    pass
                 continue
 
             entry = CacheEntry.from_dict(entry_data)
@@ -195,6 +200,20 @@ class ToolCache:
         hits.sort(key=lambda h: h.weighted_score, reverse=True)
         return hits
 
+    def _touch_entry(self, entry_id: str) -> None:
+        """Refresh access time and derived score for an entry."""
+        updated = self._storage.update_access_time(entry_id)
+        if not updated:
+            return
+
+        entry_data = self._storage.get(entry_id)
+        if entry_data is None:
+            return
+
+        entry = CacheEntry.from_dict(entry_data)
+        score = self._compute_entry_score(entry)
+        self._storage.update_score(entry_id, score)
+
     def get_best_match(
         self,
         tool_name: str,
@@ -203,7 +222,7 @@ class ToolCache:
         """Get the best matching cache entry if similarity threshold is met."""
         hits = self.search(tool_name, input_args, top_k=1)
         if hits and hits[0].similarity >= self.config.similarity_threshold:
-            self._storage.update_access_time(hits[0].entry.id)
+            self._touch_entry(hits[0].entry.id)
             return hits[0]
         return None
 
@@ -241,13 +260,20 @@ class ToolCache:
         )
 
         score = self._compute_entry_score(entry)
-        self._storage.set(entry_id, entry.to_dict(), score=score)
         self.vector_store.add(
             ids=[entry_id],
             embeddings=[embedding],
             documents=[input_text],
             metadata=[{"tool_name": tool_name}],
         )
+        try:
+            self._storage.set(entry_id, entry.to_dict(), score=score)
+        except Exception:
+            try:
+                self.vector_store.delete(ids=[entry_id])
+            except Exception:
+                pass
+            raise
 
         self._maybe_evict()
         return entry

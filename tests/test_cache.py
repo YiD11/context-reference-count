@@ -1,5 +1,6 @@
 """Tests for ToolCache."""
 
+from datetime import datetime, timedelta
 import uuid
 
 import pytest
@@ -7,6 +8,8 @@ import pytest
 from context_ref.core.cache import ToolCache
 from context_ref.core.config import CacheConfig
 from context_ref.core.storage import ChromaVectorStore, MemoryStorageBackend
+from context_ref.core.storage.vector import VectorStore
+from context_ref.core.utils import compute_weighted_score
 from context_ref.embedding.base import EmbeddingFunction
 
 
@@ -24,7 +27,9 @@ class MockEmbedding(EmbeddingFunction):
         return [int(h[i : i + 2], 16) / 255.0 for i in range(0, 32, 2)]
 
 
-def create_test_cache(embedding_func=None, eviction_policy="score", max_size=10) -> ToolCache:
+def create_test_cache(
+    embedding_func=None, eviction_policy="score", max_size=10
+) -> ToolCache:
     """Create a ToolCache with isolated storage for testing."""
     collection_name = f"test_cache_{uuid.uuid4().hex[:8]}"
     storage = MemoryStorageBackend()
@@ -41,6 +46,34 @@ def create_test_cache(embedding_func=None, eviction_policy="score", max_size=10)
         storage=storage,
         vector_store=vector_store,
     )
+
+
+class FailingVectorStore(VectorStore):
+    def add(
+        self,
+        ids: list[str],
+        embeddings: list[list[float]],
+        documents: list[str],
+        metadata: list[dict] | None = None,
+    ) -> None:
+        raise RuntimeError("vector add failed")
+
+    def search(
+        self,
+        query_embedding: list[float],
+        k: int = 5,
+        filter: dict | None = None,
+    ) -> dict:
+        return {"ids": [[]], "distances": [[]], "metadatas": [[]], "documents": [[]]}
+
+    def delete(self, ids: list[str]) -> None:
+        return None
+
+    def clear(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
 
 
 class TestToolCache:
@@ -66,6 +99,25 @@ class TestToolCache:
         assert len(hits) >= 1
         assert hits[0].entry.tool_name == "search"
         assert hits[0].entry.output == "Python is a programming language"
+
+    def test_save_rolls_back_when_vector_write_fails(self) -> None:
+        """Vector 写入失败时，不应该落 storage（避免只写一边）。"""
+        storage = MemoryStorageBackend()
+        cache = ToolCache(
+            config=CacheConfig(similarity_threshold=0.5),
+            embedding_func=MockEmbedding(),
+            storage=storage,
+            vector_store=FailingVectorStore(),
+        )
+
+        with pytest.raises(RuntimeError):
+            cache.save(
+                tool_name="search",
+                input_args={"query": "what is python"},
+                output="Python is a programming language",
+            )
+
+        assert storage.size() == 0
 
     def test_save_updates_existing_entry(self, cache: ToolCache) -> None:
         """Test that saving same input updates existing entry."""
@@ -151,6 +203,45 @@ class TestToolCache:
             input_args={"query": "test"},
         )
         assert hit_none is None
+
+    def test_get_best_match_refreshes_score_after_touch(self, cache: ToolCache) -> None:
+        """命中后会更新访问时间，并刷新 score（对 score 淘汰更公平）。"""
+        entry = cache.save(
+            tool_name="search",
+            input_args={"query": "touch score"},
+            output="ok",
+        )
+        cache.increment_reuse(entry.id)
+
+        raw = cache.storage.get(entry.id)
+        assert raw is not None
+
+        old_time = datetime.now() - timedelta(hours=500)
+        raw["last_accessed_at"] = old_time.isoformat()
+
+        low_score = compute_weighted_score(
+            similarity=1.0,
+            reuse_count=raw.get("reuse_count", 0),
+            provide_context_count=raw.get("provide_context_count", 0),
+            last_accessed=old_time,
+            reuse_context_factor=cache.config.reuse_context_factor,
+            time_decay_lambda=cache.config.time_decay_lambda,
+        )
+        cache.storage.set(entry.id, raw, score=low_score)
+
+        before = cache.storage.get_score(entry.id)
+        assert before is not None
+        assert before == pytest.approx(low_score)
+
+        hit = cache.get_best_match(
+            tool_name="search",
+            input_args={"query": "touch score"},
+        )
+        assert hit is not None
+
+        after = cache.storage.get_score(entry.id)
+        assert after is not None
+        assert after > before
 
     def test_eviction_policies(self) -> None:
         """Test different eviction policies."""
