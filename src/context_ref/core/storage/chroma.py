@@ -3,6 +3,7 @@
 from typing import Any
 
 import chromadb
+from chromadb.api import ClientAPI
 from chromadb.config import Settings
 
 from context_ref.core.config import get_chroma_config
@@ -25,8 +26,18 @@ class ChromaVectorStore(VectorStore):
         self._port = port
         self._path = path
         self._mode = mode
-        self._client: Any = None
-        self._collection: Any = None
+        self._client: ClientAPI | None = None
+        self._collection: chromadb.Collection | None = None
+    
+    def get_client(self) -> ClientAPI:
+        self._init_client()
+        assert isinstance(self._client, ClientAPI)
+        return self._client
+    
+    def get_collection(self) -> chromadb.Collection:
+        self._init_client()
+        assert isinstance(self._collection, chromadb.Collection)
+        return self._collection
 
     def _init_client(self) -> None:
         if self._client is not None:
@@ -58,7 +69,8 @@ class ChromaVectorStore(VectorStore):
         metadata: list[dict[str, Any]] | None = None,
     ) -> None:
         self._init_client()
-        self._collection.add(
+        collection = self.get_collection()
+        collection.add(
             ids=ids,
             embeddings=embeddings,
             documents=documents,
@@ -70,9 +82,10 @@ class ChromaVectorStore(VectorStore):
         query_embedding: list[float],
         k: int = 5,
         filter: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    ) -> chromadb.QueryResult:
         self._init_client()
-        return self._collection.query(
+        collection = self.get_collection()
+        return collection.query(
             query_embeddings=[query_embedding],
             n_results=k,
             where=filter,
@@ -84,9 +97,9 @@ class ChromaVectorStore(VectorStore):
             self._collection.delete(ids=ids)
 
     def clear(self) -> None:
-        self._init_client()
-        self._client.delete_collection(self._collection_name)
-        self._collection = self._client.create_collection(
+        c = self.get_client()
+        c.delete_collection(self._collection_name)
+        self._collection = c.create_collection(
             name=self._collection_name,
             metadata={"hnsw:space": "cosine"},
         )
